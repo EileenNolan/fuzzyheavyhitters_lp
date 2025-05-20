@@ -64,7 +64,8 @@ $ cargo run --release --bin server -- --config src/bin/config.json --server_id 1
 Now, the servers should be ready to process client requests. In a third shell, run the following command to send `1000` client requests to the servers (this will take some time):
 
 ```
-$ cargo run --release --bin leader -- --config src/bin/config.json -n 1000
+$ cargo run --release --bin known_leader_lp -- --config src/bin/config.json -n 1000
+cargo run --release --bin leader -- --config src/bin/config.json -n 1000
 ```
 
 You should see lots of output...

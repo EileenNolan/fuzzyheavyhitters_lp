@@ -11,7 +11,11 @@ pub mod rpc;
 pub mod sketch;
 pub mod ibDCF;
 pub mod equalitytest;
+pub mod sum_leqtest;
+pub mod sum_leq_binary;
 pub mod sample_covid_data;
+pub mod lagrange;
+pub mod lp_field;
 
 #[macro_use]
 extern crate lazy_static;

@@ -10,10 +10,17 @@ use crate::ibDCF::{ibDCFKey, EvalState, eval_str};
 use ocelot::{ot::AlszReceiver as OtReceiver, ot::AlszSender as OtSender};
 use ocelot::ot::{Receiver, Sender};
 use crate::equalitytest::{multiple_gb_equality_test, multiple_ev_equality_test};
+use crate::sum_leqtest::{multiple_gb_less_test, multiple_ev_less_test};
+use crate::sum_leq_binary::{multiple_gb_sum, multiple_ev_sum};
 use crate::field::BlockPair;
 use std::marker::PhantomData;
 use std::net::TcpStream;
 use std::time::Instant;
+use crate::FieldElm;
+use crate::lagrange::{evaluate_polynomial,evaluate_client_polynomial};
+use num_traits::cast::ToPrimitive; // Make sure this is imported
+
+pub const MODULUS_64: u64 = 9223372036854775783u64;
 
 #[derive(Clone)]
 struct TreeNode {
@@ -25,11 +32,18 @@ unsafe impl Send for TreeNode {}
 unsafe impl Sync for TreeNode {}
 
 
+pub type Poly = Vec<Vec<FieldElm>>;
+pub type PolyPair = (Poly, Poly);
+
+
+
 #[derive(Clone)]
 pub struct KeyCollection<T,U>
 {
     depth: usize,
     pub keys: Vec<(bool, Vec<(ibDCFKey, ibDCFKey)>)>,
+    pub poly: Vec<Poly>,
+    pub polynomials: Vec<Vec<Vec<FieldElm>>>,
     frontier: Vec<TreeNode>,
     frontier_last: Vec<Result<U>>,
     rand_stream: prg::PrgStream,
@@ -42,16 +56,31 @@ pub struct Result<T> {
     pub value: T,
 }
 
+fn field_elm_to_bits(fe: &FieldElm) -> Vec<bool> {
+    let val = fe.value.to_u128().expect("Value does not fit in u128");
+    (0..128).map(|i| ((val >> i) & 1) == 1).collect()
+}
+
 impl<T,U> KeyCollection<T,U>
 where
     T: Share + Clone + std::fmt::Debug + PartialOrd + From<u32> + Send + Sync + TryFrom<Block> + Into<Block>,
-    U: Share + Clone + std::fmt::Debug + PartialOrd + From<u32> + Send + Sync + TryFrom<BlockPair> + Into<BlockPair>,
+    U: Share + Clone
+       + std::fmt::Debug
+       + PartialOrd
+       + From<u32>
+       + Send
+       + Sync
+       + TryFrom<BlockPair>
+       + Into<BlockPair>
+       + Into<u128>, // New: U must be convertible into u128
     <U as TryFrom<BlockPair>>::Error: std::fmt::Debug,
 {
     pub fn new(seed: &prg::PrgSeed, depth: usize) -> KeyCollection<T,U> {
         KeyCollection::<T,U> {
             depth,
             keys: vec![],
+            polynomials: vec![],      // initialize the new field
+            poly: vec![],
             frontier: vec![],
             frontier_last: vec![],
             rand_stream: seed.to_rng(),
@@ -63,6 +92,14 @@ where
         self.keys.push((true, key)); //TODO: come back and remove this bool
 
     }
+    
+    // New function: add_polynomial.
+    // This function takes a polynomial (which we represent as a Vec<FieldElm>)
+    // and stores it. You can later process these polynomials as needed.
+    pub fn add_polynomial(&mut self, poly: Poly) {
+        self.poly.push(poly);
+    }
+
 
     pub fn tree_init(&mut self) {
         let mut root = TreeNode {
@@ -118,255 +155,6 @@ where
         child
     }
 
-
-    // pub fn tree_crawl(&mut self, gc_sender: bool, channel: Option<&mut SyncChannel<BufReader<UnixStream>, BufWriter<UnixStream>>>) -> Vec<T> {
-    //     println!("Crawl");
-    //     let start = Instant::now();
-    //     let next_frontier = self
-    //         .frontier
-    //         .par_iter()
-    //         .map(|node| {
-    //             let mut children = vec![];
-    //             let search_strings = all_bit_vectors(node.key_states[0].len());
-    //             for s in search_strings {
-    //                 children.push(self.make_tree_node(node, &s));
-    //             }
-    //             children
-    //         })
-    //         .flatten()
-    //         .collect::<Vec<TreeNode>>();
-    //     let node_client_string : Vec<Vec<Vec<bool>>> = next_frontier
-    //         .par_iter()
-    //         .map(|node| {
-    //             node.key_states
-    //                 .par_iter()
-    //                 .map(|state|{
-    //                     let mut left_bits:Vec<bool> = state.iter().map(|(left, right)| left.y_bit ^ left.bit).collect();
-    //                     let mut right_bits:Vec<bool> = state.iter().map(|(left, right)| right.y_bit ^ right.bit).collect();
-    //                     left_bits.append(&mut right_bits);
-    //                     left_bits
-    //                     // state.iter().map(|(left, right)| left.y_bit).collect()
-    //                 })
-    //                 .collect()
-    //         })
-    //         .collect();
-    //     let non_mpc = start.elapsed();
-    //     let all_client_strings: Vec<Vec<u16>> = node_client_string
-    //         .iter()
-    //         .flat_map(|node| node.iter().map(|client| client.iter().map(|&b| b as u16).collect::<Vec<u16>>()))
-    //         .collect();
-    //     println!("Tree searching and FSS - {:?}", non_mpc);
-    //     let channel = channel.unwrap();
-    //     let mut rng = AesRng::new();
-    //     let mut all_binary_shares = if gc_sender {
-    //         multiple_gb_equality_test(&mut rng, channel, &all_client_strings.as_slice())
-    //     } else {
-    //         multiple_ev_equality_test(&mut rng, channel, &all_client_strings.as_slice())
-    //     };
-    //     let gc = start.elapsed() - non_mpc;
-    //     println!("Garbled circuit - {:?}", gc);
-    //     let mut all_node_vals = vec![];
-    //     if gc_sender{
-    //         let mut all_shares = Vec::with_capacity(all_binary_shares.len());
-    //         for i in 0..all_binary_shares.len() {
-    //             let r0 = T::random();
-    //             let mut r1 = r0.clone();
-    //             r1.add(&T::one());
-    //             all_node_vals.push(r1.clone());
-    //             let r0_block: Block = r0.try_into().expect("Conversion failed");
-    //             let r1_block: Block = r1.try_into().expect("Conversion failed");
-    //             if all_binary_shares[i] {
-    //                 all_shares.push((r0_block, r1_block));
-    //             } else {
-    //                 all_shares.push((r1_block, r0_block));
-    //             }
-    //         }
-    //         let mut ot = OtSender::init(channel, &mut rng).unwrap();
-    //         ot.send(channel, all_shares.as_slice(), &mut rng).map_err(|e| {
-    //             println!("Error in tree_crawl ot send")
-    //         }).unwrap();
-    //     }
-    //     else{
-    //         let mut ot = OtReceiver::init(channel, &mut rng).unwrap();
-    //         let out_blocks = ot.receive(channel, all_binary_shares.as_slice(), &mut rng).unwrap();
-    //         all_node_vals = out_blocks.into_iter()
-    //             .map(|b| {
-    //                 T::try_from(b)
-    //                     .map_err(|e| {
-    //                         // eprintln!("Conversion error: {:?}", e);  // Changed to {:?}
-    //                         // e
-    //                     })
-    //                     .unwrap()
-    //             })
-    //             .collect();
-    //     }
-    //     let ot = start.elapsed() - gc - non_mpc;
-    //     println!("Garbled circuit and OT - {:?}", ot);
-    //     let mut results_by_node = Vec::new();
-    //     let mut current_idx = 0;
-    //     for node in &node_client_string {
-    //         let num_clients = node.len();
-    //         let node_results : Vec<T> = all_node_vals[current_idx..current_idx + num_clients].to_vec();
-    //         let mut node_sum = T::zero();
-    //         for (i, v) in node_results.iter().enumerate() {
-    //             // Add in only live values
-    //             if self.keys[i].0 {
-    //                 node_sum.add_lazy(v);
-    //             }
-    //         }
-    //         results_by_node.push(node_sum);
-    //         current_idx += num_clients;
-    //     }
-    //
-    //     println!("Field actions - {:?}", start.elapsed() - (ot + gc + non_mpc));
-    //     println!("...done");
-    //     self.frontier = next_frontier;
-    //     results_by_node
-    // }
-
-    ///With multithreaded gc
-    // pub fn tree_crawl(
-    //     &mut self,
-    //     gc_sender: bool,
-    //     channels: &mut [&mut SyncChannel<BufReader<UnixStream>, BufWriter<UnixStream>>]
-    // ) -> Vec<T> {
-    //     println!("Crawl");
-    //     let start = Instant::now();
-    //
-    //     // 1. Prepare next frontier (parallel tree expansion)
-    //     let next_frontier = self
-    //         .frontier
-    //         .par_iter()
-    //         .map(|node| {
-    //             let mut children = vec![];
-    //             let search_strings = all_bit_vectors(node.key_states[0].len());
-    //             for s in search_strings {
-    //                 children.push(self.make_tree_node(node, &s));
-    //             }
-    //             children
-    //         })
-    //         .flatten()
-    //         .collect::<Vec<TreeNode>>();
-    //
-    //     // 2. Prepare client strings (parallel processing)
-    //     let node_client_string: Vec<Vec<Vec<bool>>> = next_frontier
-    //         .par_iter()
-    //         .map(|node| {
-    //             node.key_states
-    //                 .par_iter()
-    //                 .map(|state| {
-    //                     let mut left_bits: Vec<bool> = state.iter()
-    //                         .map(|(left, _)| left.y_bit ^ left.bit)
-    //                         .collect();
-    //                     let mut right_bits: Vec<bool> = state.iter()
-    //                         .map(|(_, right)| right.y_bit ^ right.bit)
-    //                         .collect();
-    //                     left_bits.append(&mut right_bits);
-    //                     left_bits
-    //                 })
-    //                 .collect()
-    //         })
-    //         .collect();
-    //
-    //     let non_mpc = start.elapsed();
-    //     println!("Tree searching and FSS - {:?}", non_mpc);
-    //
-    //     let all_client_strings: Vec<Vec<u16>> = node_client_string
-    //             .iter()
-    //             .flat_map(|node| node.iter().map(|client| client.iter().map(|&b| b as u16).collect::<Vec<u16>>()))
-    //             .collect();
-    //     let all_binary_shares = crossbeam::scope(|s| {
-    //         let mut results = vec![];
-    //         let mut handles = vec![];
-    //
-    //         let chunk_size = (all_client_strings.len() + channels.len() - 1) / channels.len();
-    //
-    //         for (i, channel) in channels.iter().enumerate() {
-    //             let start_idx = i * chunk_size;
-    //             let end_idx = std::cmp::min(start_idx + chunk_size, all_client_strings.len());
-    //             let chunk = all_client_strings[start_idx..end_idx].to_vec();
-    //
-    //             handles.push(s.spawn(move |_| {
-    //                 let mut rng = AesRng::new();
-    //                 let mut channel = (*channel).clone();
-    //                 if gc_sender {
-    //                     multiple_gb_equality_test(&mut rng, &mut channel, &chunk)
-    //                 } else {
-    //                     multiple_ev_equality_test(&mut rng, &mut channel, &chunk)
-    //                 }
-    //             }));
-    //         }
-    //
-    //         for handle in handles {
-    //             results.extend(handle.join().unwrap());
-    //         }
-    //
-    //         results
-    //     }).unwrap();
-    //
-    //     let gc = start.elapsed() - non_mpc;
-    //     println!("Garbled circuit - {:?}", gc);
-    //     let mut channel_ot = channels[0].clone();
-    //     let mut rng = AesRng::new();
-    //
-    //     let mut all_node_vals = vec![];
-    //     if gc_sender{
-    //         let mut all_shares = Vec::with_capacity(all_binary_shares.len());
-    //         for i in 0..all_binary_shares.len() {
-    //             let r0 = T::random();
-    //             let mut r1 = r0.clone();
-    //             r1.add(&T::one());
-    //             all_node_vals.push(r1.clone());
-    //             let r0_block: Block = r0.try_into().expect("Conversion failed");
-    //             let r1_block: Block = r1.try_into().expect("Conversion failed");
-    //             if all_binary_shares[i] {
-    //                 all_shares.push((r0_block, r1_block));
-    //             } else {
-    //                 all_shares.push((r1_block, r0_block));
-    //             }
-    //         }
-    //         let mut ot = OtSender::init(&mut channel_ot, &mut rng).unwrap();
-    //         ot.send(&mut channel_ot, all_shares.as_slice(), &mut rng).map_err(|e| {
-    //             println!("Error in tree_crawl ot send")
-    //         }).unwrap();
-    //     }
-    //     else{
-    //         let mut ot = OtReceiver::init(&mut channel_ot, &mut rng).unwrap();
-    //         let out_blocks = ot.receive(&mut channel_ot, all_binary_shares.as_slice(), &mut rng).unwrap();
-    //         all_node_vals = out_blocks.into_iter()
-    //             .map(|b| {
-    //                 T::try_from(b)
-    //                     .map_err(|e| {
-    //                         // eprintln!("Conversion error: {:?}", e);  // Changed to {:?}
-    //                         // e
-    //                     })
-    //                     .unwrap()
-    //             })
-    //             .collect();
-    //     }
-    //     let ot = start.elapsed() - gc - non_mpc;
-    //     println!("OT - {:?}", ot);
-    //     let mut results_by_node = Vec::new();
-    //     let mut current_idx = 0;
-    //     for node in &node_client_string {
-    //         let num_clients = node.len();
-    //         let node_results : Vec<T> = all_node_vals[current_idx..current_idx + num_clients].to_vec();
-    //         let mut node_sum = T::zero();
-    //         for (i, v) in node_results.iter().enumerate() {
-    //             // Add in only live values
-    //             if self.keys[i].0 {
-    //                 node_sum.add_lazy(v);
-    //             }
-    //         }
-    //         results_by_node.push(node_sum);
-    //         current_idx += num_clients;
-    //     }
-    //
-    //     println!("Field actions - {:?}", start.elapsed() - (ot + gc + non_mpc));
-    //     println!("...done");
-    //     self.frontier = next_frontier;
-    //     results_by_node
-    // }
     pub fn tree_crawl(
         &mut self,
         gc_sender: bool,
@@ -410,7 +198,8 @@ where
             .collect();
 
         let non_mpc = start.elapsed();
-        println!("Tree searching and FSS - {:?}", non_mpc);
+        println!("Tree searching and FSS - {:?}", non_mpc); 
+        //PARALLELIZATION
 
         let all_client_strings: Vec<Vec<u16>> = node_client_string
             .iter()
@@ -505,272 +294,6 @@ where
         self.frontier = next_frontier;
         results_by_node
     }
-
-
-
-    // pub fn tree_crawl(
-    //     &mut self,
-    //     gc_sender: bool,
-    //     channels: &mut [&mut SyncChannel<BufReader<UnixStream>, BufWriter<UnixStream>>]
-    // ) -> Vec<T> {
-    //     println!("Crawl");
-    //     let start = Instant::now();
-    //
-    //     // 1. Prepare next frontier (parallel tree expansion)
-    //     let next_frontier = self
-    //         .frontier
-    //         .par_iter()
-    //         .map(|node| {
-    //             let mut children = vec![];
-    //             let search_strings = all_bit_vectors(node.key_states[0].len());
-    //             for s in search_strings {
-    //                 children.push(self.make_tree_node(node, &s));
-    //             }
-    //             children
-    //         })
-    //         .flatten()
-    //         .collect::<Vec<TreeNode>>();
-    //
-    //     // 2. Prepare client strings (parallel processing)
-    //     let node_client_string: Vec<Vec<Vec<bool>>> = next_frontier
-    //         .par_iter()
-    //         .map(|node| {
-    //             node.key_states
-    //                 .par_iter()
-    //                 .map(|state| {
-    //                     let mut left_bits: Vec<bool> = state.iter()
-    //                         .map(|(left, _)| left.y_bit ^ left.bit)
-    //                         .collect();
-    //                     let mut right_bits: Vec<bool> = state.iter()
-    //                         .map(|(_, right)| right.y_bit ^ right.bit)
-    //                         .collect();
-    //                     left_bits.append(&mut right_bits);
-    //                     left_bits
-    //                 })
-    //                 .collect()
-    //         })
-    //         .collect();
-    //
-    //     let non_mpc = start.elapsed();
-    //     println!("Tree searching and FSS - {:?}", non_mpc);
-    //
-    //     // 3. Parallel GC computation
-    //     let all_client_strings: Vec<Vec<u16>> = node_client_string
-    //         .iter()
-    //         .flat_map(|node| node.iter().map(|client| client.iter().map(|&b| b as u16).collect::<Vec<u16>>()))
-    //         .collect();
-    //
-    //     let all_binary_shares = crossbeam::scope(|s| {
-    //                 let mut results = vec![];
-    //                 let mut handles = vec![];
-    //
-    //                 let chunk_size = (all_client_strings.len() + channels.len() - 1) / channels.len();
-    //
-    //                 for (i, channel) in channels.iter().enumerate() {
-    //                     let start_idx = i * chunk_size;
-    //                     let end_idx = std::cmp::min(start_idx + chunk_size, all_client_strings.len());
-    //                     let chunk = all_client_strings[start_idx..end_idx].to_vec();
-    //
-    //                     handles.push(s.spawn(move |_| {
-    //                         let mut rng = AesRng::new();
-    //                         let mut channel = (*channel).clone();
-    //                         if gc_sender {
-    //                             multiple_gb_equality_test(&mut rng, &mut channel, &chunk)
-    //                         } else {
-    //                             multiple_ev_equality_test(&mut rng, &mut channel, &chunk)
-    //                         }
-    //                     }));
-    //                 }
-    //
-    //                 for handle in handles {
-    //                     results.extend(handle.join().unwrap());
-    //                 }
-    //
-    //                 results
-    //             }).unwrap();
-    //
-    //     let gc = start.elapsed() - non_mpc;
-    //     println!("Garbled circuit - {:?}", gc);
-    //
-    //     // 4. Parallel OT operations
-    //     let all_node_vals: Vec<T> = if gc_sender {
-    //         // Prepare OT shares in parallel
-    //         let shares: Vec<(Block, Block)> = all_binary_shares
-    //             .par_iter()
-    //             .map(|&b| {
-    //                 let r0 = T::random();
-    //                 let mut r1 = r0.clone();
-    //                 r1.add(&T::one());
-    //                 let r0_block: Block = r0.try_into().expect("Conversion failed");
-    //                 let r1_block: Block = r1.try_into().expect("Conversion failed");
-    //                 if b { (r0_block, r1_block) } else { (r1_block, r0_block) }
-    //             })
-    //             .collect();
-    //
-    //         // Perform OT send
-    //         let mut rng = AesRng::new();
-    //         let mut channel_ot = channels[0].clone();
-    //         let mut ot = OtSender::init(&mut channel_ot, &mut rng).unwrap();
-    //         ot.send(&mut channel_ot, &shares, &mut rng)
-    //             .map_err(|e| println!("Error in tree_crawl ot send"))
-    //             .unwrap();
-    //
-    //         // Return the r1 values
-    //         shares.into_par_iter().map(|(_, r1)| T::try_from(r1).map_err(|_| ()).unwrap()).collect()
-    //     } else {
-    //         // Perform OT receive
-    //         let mut rng = AesRng::new();
-    //         let mut channel_ot = channels[0].clone();
-    //         let out_blocks = {
-    //             let mut ot = OtReceiver::init(&mut channel_ot, &mut rng).unwrap();
-    //             ot.receive(&mut channel_ot, &all_binary_shares, &mut rng).unwrap()
-    //         };
-    //
-    //         // Convert blocks to T in parallel
-    //         out_blocks.into_par_iter()
-    //             .map(|b| T::try_from(b).map_err(|_| ()).unwrap())
-    //             .collect()
-    //     };
-    //
-    //     let ot = start.elapsed() - gc - non_mpc;
-    //     println!("OT - {:?}", ot);
-    //
-    //     // 5. Parallel field operations (summing node values)
-    //     let results_by_node: Vec<T> = crossbeam::scope(|s| {
-    //         let chunk_size = (node_client_string.len() + num_cpus::get() - 1) / num_cpus::get();
-    //         node_client_string
-    //             .par_chunks(chunk_size)
-    //             .enumerate()
-    //             .map(|(chunk_idx, chunk)| {
-    //                 let start_idx = chunk_idx * chunk_size;
-    //                 let keys = &self.keys;
-    //
-    //                 chunk.iter().enumerate().map(|(local_idx, node)| {
-    //                     let global_idx = start_idx + local_idx;
-    //                     let num_clients = node.len();
-    //                     let node_results = &all_node_vals[global_idx..global_idx + num_clients];
-    //
-    //                     let mut node_sum = T::zero();
-    //                     for (i, v) in node_results.iter().enumerate() {
-    //                         if keys[i].0 {
-    //                             node_sum.add_lazy(v);
-    //                         }
-    //                     }
-    //                     node_sum
-    //                 }).collect::<Vec<T>>()
-    //             })
-    //             .flatten()
-    //             .collect()
-    //     }).unwrap();
-    //
-    //     println!("Field actions - {:?}", start.elapsed() - (ot + gc + non_mpc));
-    //     println!("...done");
-    //     self.frontier = next_frontier;
-    //     results_by_node
-    // }
-
-    // pub fn tree_crawl_last(&mut self, gc_sender: bool, channel: Option<&mut SyncChannel<BufReader<UnixStream>, BufWriter<UnixStream>>>) -> Vec<U> {
-    //     println!("Crawl");
-    //     let next_frontier = self
-    //         .frontier
-    //         .par_iter()
-    //         .map(|node| {
-    //             let mut children = vec![];
-    //             let search_strings = all_bit_vectors(node.key_states[0].len());
-    //             for s in search_strings {
-    //                 children.push(self.make_tree_node(node, &s));
-    //             }
-    //             children
-    //         })
-    //         .flatten()
-    //         .collect::<Vec<TreeNode>>();
-    //     let node_client_string : Vec<Vec<Vec<bool>>> = next_frontier
-    //         .par_iter()
-    //         .map(|node| {
-    //             node.key_states
-    //                 .par_iter()
-    //                 .map(|state|{
-    //                     let mut left_bits:Vec<bool> = state.iter().map(|(left, right)| left.y_bit ^ left.bit).collect();
-    //                     let mut right_bits:Vec<bool> = state.iter().map(|(left, right)| right.y_bit ^ right.bit).collect();
-    //                     left_bits.append(&mut right_bits);
-    //                     left_bits
-    //                     // state.iter().map(|(left, right)| left.y_bit).collect()
-    //                 })
-    //                 .collect()
-    //         })
-    //         .collect();
-    //     let channel = channel.unwrap();
-    //
-    //     let all_client_strings: Vec<Vec<u16>> = node_client_string
-    //         .par_iter()
-    //         .flat_map(|node| node.par_iter().map(|client| client.iter().map(|&b| b as u16).collect::<Vec<u16>>()))
-    //         .collect();
-    //     let mut rng = AesRng::new();
-    //     let mut all_binary_shares = if gc_sender {
-    //         multiple_gb_equality_test(&mut rng, channel, &all_client_strings.as_slice())
-    //     } else {
-    //         multiple_ev_equality_test(&mut rng, channel, &all_client_strings.as_slice())
-    //     };
-    //     let mut all_node_vals = vec![];
-    //     if gc_sender{
-    //         let mut all_shares = Vec::with_capacity(all_binary_shares.len());
-    //         for i in 0..all_binary_shares.len() {
-    //             let r0 = U::random();
-    //             let mut r1 = r0.clone();
-    //             r1.add(&U::one());
-    //             all_node_vals.push(r1.clone());
-    //             let r0_block: BlockPair = r0.try_into().expect("Conversion failed");
-    //             let r1_block: BlockPair = r1.try_into().expect("Conversion failed");
-    //             if all_binary_shares[i] {
-    //                 all_shares.push((r0_block.0[0], r1_block.0[0]));
-    //                 all_shares.push((r0_block.0[1], r1_block.0[1]));
-    //             } else {
-    //                 all_shares.push((r1_block.0[0], r0_block.0[0]));
-    //                 all_shares.push((r1_block.0[1], r0_block.0[1]));
-    //             }
-    //         }
-    //         let mut ot = OtSender::init(channel, &mut rng).unwrap();
-    //         ot.send(channel, all_shares.as_slice(), &mut rng).unwrap();
-    //     }
-    //     else{
-    //         let mut ot = OtReceiver::init(channel, &mut rng).unwrap();
-    //         let doubled_binary_shares = all_binary_shares.iter().flat_map(|&b| [b, b]).collect::<Vec<bool>>();
-    //         let out_blocks = ot.receive(channel, doubled_binary_shares.as_slice(), &mut rng).unwrap();
-    //         let mut i = 0;
-    //         while i < out_blocks.len() - 1 {
-    //             let val = U::try_from(BlockPair([out_blocks[i], out_blocks[i+1]])).map_err(|e| {
-    //                 // eprintln!("Conversion error: {:?}", e);  // Changed to {:?}
-    //                 // e
-    //                 }).unwrap();
-    //             all_node_vals.push(val);
-    //             i += 2;
-    //         }
-    //     }
-    //     let mut results_by_node = Vec::new();
-    //     let mut current_idx = 0;
-    //     for node in &node_client_string {
-    //         let num_clients = node.len();
-    //         let node_results : Vec<U> = all_node_vals[current_idx..current_idx + num_clients].to_vec();
-    //         let mut node_sum = U::zero();
-    //         for (i, v) in node_results.iter().enumerate() {
-    //             // Add in only live values
-    //             if self.keys[i].0 {
-    //                 node_sum.add_lazy(v);
-    //             }
-    //         }
-    //         results_by_node.push(node_sum);
-    //         current_idx += num_clients;
-    //     }
-    //     println!("...done");
-    //
-    //     self.frontier_last = next_frontier.par_iter().enumerate().map(|(i,node)| {
-    //         Result::<U> {
-    //             path: node.path.clone(),
-    //             value: results_by_node[i].clone(),
-    //         }
-    //     }).collect::<Vec<Result<U>>>();
-    //     results_by_node
-    // }
 
     pub fn tree_crawl_last(
         &mut self,
@@ -913,6 +436,231 @@ where
                 }
             }).collect::<Vec<Result<U>>>();
         results_by_node
+    }
+
+    // pub fn evaluate_client_polynomial(client_poly: &[Vec<FieldElm>], w: &[u64]) -> FieldElm {
+    //     assert_eq!(client_poly.len(), w.len(), "Dimension mismatch.");
+    //     //let mut sum = FieldElm::from(0);
+    //     let mut sum = FieldElm::from(0u64);
+
+    //     for i in 0..w.len() {
+    //         // If no hashing is involved, directly convert:
+    //         let key_i = FieldElm::from(w[i]);
+    //         let x_i = evaluate_polynomial(&client_poly[i], &key_i);
+    //         sum = FieldElm::from((sum.value + x_i.value) % MODULUS_64);
+    //     }
+    //     sum
+    // }
+
+
+    pub fn tree_crawl_last_known_poly(
+        &mut self,
+        gc_sender: bool,
+        channels: &mut [&mut SyncChannel<BufReader<TcpStream>, BufWriter<TcpStream>>]
+    ) -> u128 {
+        println!("pub fn tree_crawl_last_known_poly");
+        let start = Instant::now();
+
+        // 1. Prepare next frontier (parallel polynomial evaluations)
+        let server_w: Vec<u64> = vec![5u64, 10]; // One value per dimension
+        println!("self.polynomials = {:?}", self.polynomials);
+
+        let node_client_string: Vec<FieldElm> = self.poly
+            .iter()
+            .map(|client_poly| {
+                // Evaluate the polynomial over all dimensions using server_w.
+                evaluate_client_polynomial(client_poly, &server_w)
+            })
+            .collect();
+        println!("node_client_string length = {}", node_client_string.len());
+
+        // for (i, elm) in node_client_string.iter().enumerate() {
+        //     println!("Element {}: {:?}", i, elm);
+        // }
+            
+        // Convert FieldElm values into u128 for the next step
+        let next_frontier: Vec<u128> = node_client_string
+        .iter()
+        .map(|fe| fe.value.to_u128().expect("BigUint to u128 conversion failed"))
+        .collect();
+        println!("next_frontier length = {}", next_frontier.len());
+        //let next_frontier: Vec<u128> = node_client_string.iter().map(|fe| fe.value).collect();
+
+        let non_mpc = start.elapsed();
+        println!("Poly evaluations - {:?}", non_mpc);
+
+        // Convert `FieldElm` values into bit-representations for the garbled circuit
+        let all_client_strings: Vec<Vec<u16>> = node_client_string
+            .iter()
+            .map(|fe| {
+                // Assuming FieldElm has a method to extract bits
+                let bits: Vec<bool> = field_elm_to_bits(fe);
+                bits.into_iter().map(|b| if b { 1u16 } else { 0u16 }).collect::<Vec<u16>>()
+            })
+            .collect();
+
+        println!("PROGRESS STOPPED HERE! Next step is the garbled circuit.");
+        println!("number of channels = {}", channels.len());
+        let all_node_vals = crossbeam::scope(|s| {
+            let mut results = vec![];
+            let mut handles = vec![];
+
+            let chunk_size = (next_frontier.len() + channels.len() - 1) / channels.len();
+
+            for (i, channel) in channels.iter().enumerate() {
+                let start_idx = i * chunk_size;
+                let end_idx = std::cmp::min(start_idx + chunk_size, next_frontier.len());
+                let chunk = next_frontier[start_idx..end_idx].to_vec();
+            
+                for (i, c) in chunk.iter().enumerate() {
+                    println!("chunk element {}: {:?}", i, c);
+                }
+                // Capture the index for use inside the closure.
+                let local_i = i;
+                handles.push(s.spawn(move |_| {
+                    let mut rng = AesRng::new();
+                    // Clone the channel.
+                    let mut channel = (*channel).clone();
+            
+                    // Call the garbled-circuit function in batch.
+                    // Here, multiple_gb_sum and multiple_ev_sum now return Vec<u128>,
+                    // where each u128 is expected to be either 0 or 1.
+                    let bin_shares = if gc_sender {
+                        multiple_gb_sum(&mut rng, &mut channel, &[chunk])
+                    } else {
+                        multiple_ev_sum(&mut rng, &mut channel, &[chunk])
+                    };
+            
+                    // Print out the binary shares for this sender.
+                    println!("Sender {}: bin_shares: {:?}", local_i, bin_shares);
+                    
+                    let mut node_vals = vec![];
+                    if gc_sender {
+                        let mut all_shares = Vec::with_capacity(bin_shares.len());
+                        for i in 0..bin_shares.len() {
+                            let r0 = U::random();
+                            let mut r1 = r0.clone();
+                            r1.add(&U::one());
+                            // For our garbler-based OT, we push a default value (here we choose r1)
+                            node_vals.push(r1.clone());
+                            let r0_block: BlockPair = r0.try_into().expect("Conversion failed");
+                            let r1_block: BlockPair = r1.try_into().expect("Conversion failed");
+                            // Compare bin_shares[i] to 1 (instead of if bin_shares[i])
+                            if bin_shares[i] == 1 {
+                                all_shares.push((r0_block.0[0], r1_block.0[0]));
+                                all_shares.push((r0_block.0[1], r1_block.0[1]));
+                            } else {
+                                all_shares.push((r1_block.0[0], r0_block.0[0]));
+                                all_shares.push((r1_block.0[1], r0_block.0[1]));
+                            }
+                        }
+                        let mut ot = OtSender::init(&mut channel, &mut rng).unwrap();
+                        ot.send(&mut channel, all_shares.as_slice(), &mut rng)
+                            .map_err(|e| {
+                                println!("Error in tree_crawl ot send")
+                            })
+                            .unwrap();
+                    } else {
+                        let mut ot = OtReceiver::init(&mut channel, &mut rng).unwrap();
+                        // Convert each u128 bit to bool: a bit is 'true' if equal to 1, 'false' otherwise.
+                        let doubled_binary_shares = bin_shares.iter()
+                            .flat_map(|&b| {
+                                let bit_bool = b == 1;
+                                [bit_bool, bit_bool]
+                            })
+                            .collect::<Vec<bool>>();
+                        println!("Doubled binary shares length: {}", doubled_binary_shares.len());
+            
+                        let out_blocks = ot
+                            .receive(&mut channel, doubled_binary_shares.as_slice(), &mut rng)
+                            .expect("OT receive failed");
+                        println!("OT receiver returned {} blocks", out_blocks.len());
+            
+                        if out_blocks.len() < 2 || out_blocks.len() % 2 != 0 {
+                            eprintln!("Error: OT receiver produced {} blocks; expected a nonzero even number!", out_blocks.len());
+                            panic!("OT receiver did not produce the correct number of blocks");
+                        }
+            
+                        let mut i = 0;
+                        while i < out_blocks.len() {
+                            let bp = BlockPair([out_blocks[i], out_blocks[i+1]]);
+                            let val = U::try_from(bp).unwrap_or_else(|e| {
+                                panic!("Conversion from BlockPair failed: {:?}", e)
+                            });
+                            node_vals.push(val);
+                            i += 2;
+                        }
+                    }
+                    node_vals
+                }));
+            }
+            
+            for handle in handles {
+                results.extend(handle.join().unwrap());
+            }
+
+            results
+        }).unwrap(); 
+
+
+        let ot = start.elapsed() - non_mpc;
+        // println!("Garbled Circuit and OT - {:?}", ot);
+        // let mut results_by_node = Vec::new();
+        // let mut current_idx = 0;
+        // for node in &node_client_string {
+        //     let num_clients = node.len();
+        //     let node_results : Vec<U> = all_node_vals[current_idx..current_idx + num_clients].to_vec();
+        //     let mut node_sum = U::zero();
+        //     for (i, v) in node_results.iter().enumerate() {
+        //         // Add in only live values
+        //         if self.keys[i].0 {
+        //             node_sum.add_lazy(v);
+        //         }
+        //     }
+        //     results_by_node.push(node_sum);
+        //     current_idx += num_clients;
+        // }
+
+        // Assuming node_client_string is now a Vec<FieldElm> from your polynomial evaluations.
+        // println!("Garbled Circuit and OT - {:?}", ot);
+
+        // // If you want to aggregate them (e.g., sum relevant results) into one final result:
+        // let mut final_sum = U::zero();
+        // for (i, fe) in node_client_string.iter().enumerate() {
+        //     // Optionally, you might check if the corresponding key is marked "live"
+        //     if self.keys[i].0 {
+        //         // Depending on the type U you might have a conversion from FieldElm or extract u128, etc.
+        //         // Here, we assume you have a conversion U::from_field_elm(fe) or similar.
+        //         final_sum.add_lazy(&U::from_field_elm(fe));
+        //     }
+        // }
+
+        // println!("Field actions - {:?}", start.elapsed() - (ot + non_mpc));
+        // println!("...done");
+        // self.frontier_last = next_frontier.par_iter().enumerate().map(|(i,node)| {
+        //         Result::<U> {
+        //             path: node.path.clone(),
+        //             value: results_by_node[i].clone(),
+        //         }
+        //     }).collect::<Vec<Result<U>>>();
+        // results_by_node
+
+        //println!("Garbled Circuit and OT - {:?}", ot);
+
+        // Sum up all binary values (bits) in all_node_vals to get a final integer result.
+        let final_sum: u128 = all_node_vals
+        .iter()
+        .map(|bit| <U as Into<u128>>::into(bit.clone()))
+        .sum();
+
+
+
+        println!("Final result after garbled circuit: {}", final_sum);
+        println!("Field actions - {:?}", start.elapsed() - (ot + non_mpc));
+        println!("...done");
+
+        // Return the sum as an integer
+        final_sum
     }
 
     pub fn tree_prune(&mut self, alive_vals: &[bool]) {

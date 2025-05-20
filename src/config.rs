@@ -12,7 +12,8 @@ pub struct Config {
     pub zipf_exponent: f64,
     pub server0: SocketAddr,
     pub server1: SocketAddr,
-    pub distribution: String
+    pub distribution: String,
+    pub problem: String
 }
 
 fn parse_ip(v: &Value, error_msg: &str) -> SocketAddr {
@@ -37,6 +38,7 @@ pub fn get_config(filename: &str) -> Config {
     let server0 = parse_ip(&v["server0"], "Can't parse server0 addr");
     let server1 = parse_ip(&v["server1"], "Can't parse server1 addr");
     let distribution: String = v["distribution"].as_str().expect("Can't parse distribution").to_string();
+    let problem: String = v["problem"].as_str().expect("Can't parse distribution").to_string();
 
     Config {
         data_len,
@@ -48,7 +50,8 @@ pub fn get_config(filename: &str) -> Config {
         zipf_exponent,
         server0,
         server1,
-        distribution
+        distribution,
+        problem
     }
 }
 
