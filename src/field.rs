@@ -26,7 +26,7 @@ const MODULUS_STR: &[u8] = b"7ffffffffffffffffffffffffffffffffffffffffffffffffff
 
 //  63-bit modulus:   p = 2^63 - 25;
 pub const MODULUS_64: u64 = 9223372036854775783u64;
-pub const MODULUS_64_BIG: u128 = 9223372036854775783u128;
+pub const MODULUS_64_BIG: u128 = 9223372036854775783u128; 
 
 lazy_static! {
     static ref MODULUS: FieldElm =

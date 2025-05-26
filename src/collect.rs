@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::ibDCF::{ibDCFKey, EvalState, eval_str};
 use ocelot::{ot::AlszReceiver as OtReceiver, ot::AlszSender as OtSender};
 use ocelot::ot::{Receiver, Sender};
-use crate::equalitytest::{multiple_gb_equality_test, multiple_ev_equality_test};
+use crate::equalitytest::{multiple_gb_equality_test, multiple_ev_equality_test}; 
+use crate::equalitytest2::{multiple_gb_leq_test, multiple_ev_leq_test};
 use crate::sum_leqtest::{multiple_gb_less_test, multiple_ev_less_test};
-use crate::sum_leq_binary::{multiple_gb_sum, multiple_ev_sum};
+//use crate::sum_leq_binary::{multiple_gb_sum_batch, multiple_ev_sum_batch};
 use crate::field::BlockPair;
 use std::marker::PhantomData;
 use std::net::TcpStream;
@@ -19,6 +20,8 @@ use std::time::Instant;
 use crate::FieldElm;
 use crate::lagrange::{evaluate_polynomial,evaluate_client_polynomial};
 use num_traits::cast::ToPrimitive; // Make sure this is imported
+use scuttlebutt::Channel;
+use std::sync::{Arc, Mutex};
 
 pub const MODULUS_64: u64 = 9223372036854775783u64;
 
@@ -61,18 +64,11 @@ fn field_elm_to_bits(fe: &FieldElm) -> Vec<bool> {
     (0..128).map(|i| ((val >> i) & 1) == 1).collect()
 }
 
-impl<T,U> KeyCollection<T,U>
+impl<T, U> KeyCollection<T, U>
 where
     T: Share + Clone + std::fmt::Debug + PartialOrd + From<u32> + Send + Sync + TryFrom<Block> + Into<Block>,
-    U: Share + Clone
-       + std::fmt::Debug
-       + PartialOrd
-       + From<u32>
-       + Send
-       + Sync
-       + TryFrom<BlockPair>
-       + Into<BlockPair>
-       + Into<u128>, // New: U must be convertible into u128
+    U: Share + Clone + std::fmt::Debug + PartialOrd + From<u32> + Send + Sync + TryFrom<BlockPair> + Into<BlockPair> 
+       + Into<u128> + From<FieldElm> + PartialEq,
     <U as TryFrom<BlockPair>>::Error: std::fmt::Debug,
 {
     pub fn new(seed: &prg::PrgSeed, depth: usize) -> KeyCollection<T,U> {
@@ -452,7 +448,6 @@ where
     //     sum
     // }
 
-
     pub fn tree_crawl_last_known_poly(
         &mut self,
         gc_sender: bool,
@@ -505,48 +500,38 @@ where
             let mut results = vec![];
             let mut handles = vec![];
 
-            let chunk_size = (next_frontier.len() + channels.len() - 1) / channels.len();
+            let chunk_size = (all_client_strings.len() + channels.len() - 1) / channels.len();
 
             for (i, channel) in channels.iter().enumerate() {
                 let start_idx = i * chunk_size;
-                let end_idx = std::cmp::min(start_idx + chunk_size, next_frontier.len());
-                let chunk = next_frontier[start_idx..end_idx].to_vec();
-            
-                for (i, c) in chunk.iter().enumerate() {
-                    println!("chunk element {}: {:?}", i, c);
-                }
-                // Capture the index for use inside the closure.
-                let local_i = i;
+                let end_idx = std::cmp::min(start_idx + chunk_size, all_client_strings.len());
+                let chunk = all_client_strings[start_idx..end_idx].to_vec();
+
+                let chunk_u128: Vec<Vec<u128>> = chunk.iter()
+                .map(|vec_u16| vec_u16.iter().map(|&x| x as u128).collect())
+                .collect();
+
                 handles.push(s.spawn(move |_| {
                     let mut rng = AesRng::new();
-                    // Clone the channel.
                     let mut channel = (*channel).clone();
-            
-                    // Call the garbled-circuit function in batch.
-                    // Here, multiple_gb_sum and multiple_ev_sum now return Vec<u128>,
-                    // where each u128 is expected to be either 0 or 1.
+
                     let bin_shares = if gc_sender {
-                        multiple_gb_sum(&mut rng, &mut channel, &[chunk])
+                        multiple_gb_leq_test(&mut rng, &mut channel, &chunk_u128)
                     } else {
-                        multiple_ev_sum(&mut rng, &mut channel, &[chunk])
+                        multiple_ev_leq_test(&mut rng, &mut channel, &chunk_u128)
                     };
-            
-                    // Print out the binary shares for this sender.
-                    println!("Sender {}: bin_shares: {:?}", local_i, bin_shares);
-                    
+                    println!("did gc");
                     let mut node_vals = vec![];
-                    if gc_sender {
+                    if gc_sender{
                         let mut all_shares = Vec::with_capacity(bin_shares.len());
                         for i in 0..bin_shares.len() {
                             let r0 = U::random();
                             let mut r1 = r0.clone();
                             r1.add(&U::one());
-                            // For our garbler-based OT, we push a default value (here we choose r1)
                             node_vals.push(r1.clone());
                             let r0_block: BlockPair = r0.try_into().expect("Conversion failed");
                             let r1_block: BlockPair = r1.try_into().expect("Conversion failed");
-                            // Compare bin_shares[i] to 1 (instead of if bin_shares[i])
-                            if bin_shares[i] == 1 {
+                            if bin_shares[i] {
                                 all_shares.push((r0_block.0[0], r1_block.0[0]));
                                 all_shares.push((r0_block.0[1], r1_block.0[1]));
                             } else {
@@ -555,38 +540,17 @@ where
                             }
                         }
                         let mut ot = OtSender::init(&mut channel, &mut rng).unwrap();
-                        ot.send(&mut channel, all_shares.as_slice(), &mut rng)
-                            .map_err(|e| {
-                                println!("Error in tree_crawl ot send")
-                            })
-                            .unwrap();
-                    } else {
+                        ot.send(&mut channel, all_shares.as_slice(), &mut rng).map_err(|e| {
+                            println!("Error in tree_crawl ot send")
+                        }).unwrap();
+                    }
+                    else{
                         let mut ot = OtReceiver::init(&mut channel, &mut rng).unwrap();
-                        // Convert each u128 bit to bool: a bit is 'true' if equal to 1, 'false' otherwise.
-                        let doubled_binary_shares = bin_shares.iter()
-                            .flat_map(|&b| {
-                                let bit_bool = b == 1;
-                                [bit_bool, bit_bool]
-                            })
-                            .collect::<Vec<bool>>();
-                        println!("Doubled binary shares length: {}", doubled_binary_shares.len());
-            
-                        let out_blocks = ot
-                            .receive(&mut channel, doubled_binary_shares.as_slice(), &mut rng)
-                            .expect("OT receive failed");
-                        println!("OT receiver returned {} blocks", out_blocks.len());
-            
-                        if out_blocks.len() < 2 || out_blocks.len() % 2 != 0 {
-                            eprintln!("Error: OT receiver produced {} blocks; expected a nonzero even number!", out_blocks.len());
-                            panic!("OT receiver did not produce the correct number of blocks");
-                        }
-            
+                        let doubled_binary_shares = bin_shares.iter().flat_map(|&b| [b, b]).collect::<Vec<bool>>();
+                        let out_blocks = ot.receive(&mut channel, doubled_binary_shares.as_slice(), &mut rng).unwrap();
                         let mut i = 0;
-                        while i < out_blocks.len() {
-                            let bp = BlockPair([out_blocks[i], out_blocks[i+1]]);
-                            let val = U::try_from(bp).unwrap_or_else(|e| {
-                                panic!("Conversion from BlockPair failed: {:?}", e)
-                            });
+                        while i < out_blocks.len() - 1 {
+                            let val = U::try_from(BlockPair([out_blocks[i], out_blocks[i+1]])).map_err(|e| {}).unwrap();
                             node_vals.push(val);
                             i += 2;
                         }
@@ -594,13 +558,13 @@ where
                     node_vals
                 }));
             }
-            
+
             for handle in handles {
                 results.extend(handle.join().unwrap());
             }
 
             results
-        }).unwrap(); 
+        }).unwrap();
 
 
         let ot = start.elapsed() - non_mpc;
@@ -648,11 +612,15 @@ where
         //println!("Garbled Circuit and OT - {:?}", ot);
 
         // Sum up all binary values (bits) in all_node_vals to get a final integer result.
+        // Sum up all binary values (bits) in all_node_vals to get a final integer result.
+        println!("about to calcualte sum");
+        println!("number of channelsvalues in gc results = {}", all_node_vals.len());
+        // Assuming your output type is FieldElm and that FieldElm::one() gives you the representation of 1.
         let final_sum: u128 = all_node_vals
         .iter()
-        .map(|bit| <U as Into<u128>>::into(bit.clone()))
+        .map(|bit| if *bit == U::from(FieldElm::one()) { 1u128 } else { 0u128 })
         .sum();
-
+    
 
 
         println!("Final result after garbled circuit: {}", final_sum);
@@ -661,6 +629,7 @@ where
 
         // Return the sum as an integer
         final_sum
+
     }
 
     pub fn tree_prune(&mut self, alive_vals: &[bool]) {

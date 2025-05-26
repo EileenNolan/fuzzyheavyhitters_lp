@@ -16,6 +16,7 @@ pub mod sum_leq_binary;
 pub mod sample_covid_data;
 pub mod lagrange;
 pub mod lp_field;
+pub mod equalitytest2;
 
 #[macro_use]
 extern crate lazy_static;
