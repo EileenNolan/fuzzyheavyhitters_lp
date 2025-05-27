@@ -13,6 +13,7 @@ pub mod ibDCF;
 pub mod equalitytest;
 pub mod sum_leqtest;
 pub mod sum_leq_binary;
+pub mod equalitytest3;
 pub mod sample_covid_data;
 pub mod lagrange;
 pub mod lp_field;

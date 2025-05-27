@@ -10,7 +10,8 @@ use crate::ibDCF::{ibDCFKey, EvalState, eval_str};
 use ocelot::{ot::AlszReceiver as OtReceiver, ot::AlszSender as OtSender};
 use ocelot::ot::{Receiver, Sender};
 use crate::equalitytest::{multiple_gb_equality_test, multiple_ev_equality_test}; 
-use crate::equalitytest2::{multiple_gb_leq_test, multiple_ev_leq_test};
+//use crate::equalitytest2::{multiple_gb_leq_test, multiple_ev_leq_test};
+use crate::equalitytest3::{multiple_gb_equality_test3, multiple_ev_equality_test3};
 use crate::sum_leqtest::{multiple_gb_less_test, multiple_ev_less_test};
 //use crate::sum_leq_binary::{multiple_gb_sum_batch, multiple_ev_sum_batch};
 use crate::field::BlockPair;
@@ -47,6 +48,7 @@ pub struct KeyCollection<T,U>
     pub keys: Vec<(bool, Vec<(ibDCFKey, ibDCFKey)>)>,
     pub poly: Vec<Poly>,
     pub polynomials: Vec<Vec<Vec<FieldElm>>>,
+    poly_last: Vec<U>,
     frontier: Vec<TreeNode>,
     frontier_last: Vec<Result<U>>,
     rand_stream: prg::PrgStream,
@@ -77,6 +79,7 @@ where
             keys: vec![],
             polynomials: vec![],      // initialize the new field
             poly: vec![],
+            poly_last: Vec::new(),
             frontier: vec![],
             frontier_last: vec![],
             rand_stream: seed.to_rng(),
@@ -452,7 +455,7 @@ where
         &mut self,
         gc_sender: bool,
         channels: &mut [&mut SyncChannel<BufReader<TcpStream>, BufWriter<TcpStream>>]
-    ) -> u128 {
+    ) -> Vec<U> {
         println!("pub fn tree_crawl_last_known_poly");
         let start = Instant::now();
 
@@ -507,18 +510,27 @@ where
                 let end_idx = std::cmp::min(start_idx + chunk_size, all_client_strings.len());
                 let chunk = all_client_strings[start_idx..end_idx].to_vec();
 
-                let chunk_u128: Vec<Vec<u128>> = chunk.iter()
-                .map(|vec_u16| vec_u16.iter().map(|&x| x as u128).collect())
-                .collect();
+                // needed for leq test
+                // let chunk_u128: Vec<Vec<u128>> = chunk.iter()
+                // .map(|vec_u16| vec_u16.iter().map(|&x| x as u128).collect())
+                // .collect();
+
+                // let chunk_u128: Vec<u128> = chunk.iter().map(|vec_u16| {
+                //     let mut value: u128 = 0;
+                //     for &bit in vec_u16.iter() {
+                //         value = (value << 1) | (bit as u128);
+                //     }
+                //     value
+                // }).collect();
 
                 handles.push(s.spawn(move |_| {
                     let mut rng = AesRng::new();
                     let mut channel = (*channel).clone();
 
                     let bin_shares = if gc_sender {
-                        multiple_gb_leq_test(&mut rng, &mut channel, &chunk_u128)
+                        multiple_gb_equality_test(&mut rng, &mut channel, &chunk)
                     } else {
-                        multiple_ev_leq_test(&mut rng, &mut channel, &chunk_u128)
+                        multiple_ev_equality_test(&mut rng, &mut channel, &chunk)
                     };
                     println!("did gc");
                     let mut node_vals = vec![];
@@ -566,70 +578,21 @@ where
             results
         }).unwrap();
 
-
+        // 3. Now finish the function by marking timing, optionally aggregating results,
+        // and then updating your internal state. In this polynomial version each evaluated polynomial
+        // produces one corresponding value from the OT protocol.
         let ot = start.elapsed() - non_mpc;
-        // println!("Garbled Circuit and OT - {:?}", ot);
-        // let mut results_by_node = Vec::new();
-        // let mut current_idx = 0;
-        // for node in &node_client_string {
-        //     let num_clients = node.len();
-        //     let node_results : Vec<U> = all_node_vals[current_idx..current_idx + num_clients].to_vec();
-        //     let mut node_sum = U::zero();
-        //     for (i, v) in node_results.iter().enumerate() {
-        //         // Add in only live values
-        //         if self.keys[i].0 {
-        //             node_sum.add_lazy(v);
-        //         }
-        //     }
-        //     results_by_node.push(node_sum);
-        //     current_idx += num_clients;
-        // }
-
-        // Assuming node_client_string is now a Vec<FieldElm> from your polynomial evaluations.
-        // println!("Garbled Circuit and OT - {:?}", ot);
-
-        // // If you want to aggregate them (e.g., sum relevant results) into one final result:
-        // let mut final_sum = U::zero();
-        // for (i, fe) in node_client_string.iter().enumerate() {
-        //     // Optionally, you might check if the corresponding key is marked "live"
-        //     if self.keys[i].0 {
-        //         // Depending on the type U you might have a conversion from FieldElm or extract u128, etc.
-        //         // Here, we assume you have a conversion U::from_field_elm(fe) or similar.
-        //         final_sum.add_lazy(&U::from_field_elm(fe));
-        //     }
-        // }
-
-        // println!("Field actions - {:?}", start.elapsed() - (ot + non_mpc));
-        // println!("...done");
-        // self.frontier_last = next_frontier.par_iter().enumerate().map(|(i,node)| {
-        //         Result::<U> {
-        //             path: node.path.clone(),
-        //             value: results_by_node[i].clone(),
-        //         }
-        //     }).collect::<Vec<Result<U>>>();
-        // results_by_node
-
-        //println!("Garbled Circuit and OT - {:?}", ot);
-
-        // Sum up all binary values (bits) in all_node_vals to get a final integer result.
-        // Sum up all binary values (bits) in all_node_vals to get a final integer result.
-        println!("about to calcualte sum");
-        println!("number of channelsvalues in gc results = {}", all_node_vals.len());
-        // Assuming your output type is FieldElm and that FieldElm::one() gives you the representation of 1.
-        let final_sum: u128 = all_node_vals
-        .iter()
-        .map(|bit| if *bit == U::from(FieldElm::one()) { 1u128 } else { 0u128 })
-        .sum();
-    
-
-
-        println!("Final result after garbled circuit: {}", final_sum);
-        println!("Field actions - {:?}", start.elapsed() - (ot + non_mpc));
+        println!("Garbled Circuit and OT - {:?}", ot);
+        let field_actions = start.elapsed() - (ot + non_mpc);
+        println!("Field actions - {:?}", field_actions);
         println!("...done");
 
-        // Return the sum as an integer
-        final_sum
+        // Optionally update a field with these final results, e.g., self.poly_last.
+        // (Make sure that self.poly_last is defined appropriately in your type.)
+        self.poly_last = all_node_vals.clone();
 
+        // Return the resulting vector, one per evaluated polynomial.
+        all_node_vals
     }
 
     pub fn tree_prune(&mut self, alive_vals: &[bool]) {

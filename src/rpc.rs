@@ -7,6 +7,9 @@ use serde::Serialize;
 use crate::ibDCF::ibDCFKey;
 
 pub type Poly = Vec<Vec<FieldElm>>;
+
+pub type PolyU2 = Vec<Vec<Vec<FieldElm>>>;
+
 pub type PolyPair = (Poly, Poly);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26,6 +29,11 @@ pub struct AddKeysRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolyRequest {
     pub poly: Vec<Poly>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PolyRequestU2 {
+    pub poly: Vec<PolyU2>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -78,7 +86,7 @@ pub trait Collector {
     async fn reset(rst: ResetRequest) -> String;
     async fn add_keys(add: AddKeysRequest) -> String;
     async fn add_polynomials(poly_req: PolyRequest) -> String; // Added
-
+    async fn add_polynomials_unknown(poly_req: PolyRequestU2) -> String; // Added
     async fn tree_init(req: TreeInitRequest) -> String;
     async fn tree_crawl(req: TreeCrawlRequest) -> Vec<FE>;
     async fn tree_crawl_last(req: TreeCrawlLastRequest) -> Vec<FieldElm>;

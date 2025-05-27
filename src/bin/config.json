@@ -11,5 +11,5 @@
   "num_sites": 10000,
   "zipf_exponent": 1.03,
   "distribution": "zipf",
-  "problem": "known"
+  "problem": "unknown"
 }

@@ -46,12 +46,12 @@ pub fn compute_polynomials(
     let mut E_A = Vec::new();
     let mut E_B = Vec::new();
 
-    for i in 0..D {
+    for i in 0..d {
         let mut x_values = Vec::new();
         let mut y_values_A = Vec::new();
         let mut y_values_B = Vec::new();
 
-        for j in -DELTA..=DELTA {
+        for j in -delta..=delta {
             let key_j = FieldElm::from(q[i].wrapping_add(j as u64) % MODULUS_64);
             let dist = FieldElm::from((j.abs() as u64).pow(P as u32));
 
@@ -118,13 +118,12 @@ fn compute_list_tuples(q: isize, delta: isize) -> Vec<HashMap<isize, isize>> {
     list_tuples
 }
 
-pub fn compute_polynomials_prefix(target: &usize) -> (Vec<Vec<FieldElm>>, Vec<Vec<FieldElm>>) {
-    let q: isize = *target as isize; // Dereference target, then cast
-    let delta = DELTA;
-
-    let list_tuples = compute_list_tuples(q, delta.try_into().unwrap());
+pub fn compute_polynomials_prefix(target: u64, delta: i64, n: usize) -> (Vec<Vec<FieldElm>>, Vec<Vec<FieldElm>>) {
+    //let q: isize = *target as isize; // Dereference target, then cast
+    let q = target;
+    let list_tuples = compute_list_tuples(q.try_into().unwrap(), delta.try_into().unwrap());
     //let n = binary_tree_height(*target); 
-    let n = STRING_LENGTH;
+    //let n = STRING_LENGTH;
     println!("Height of tree is = {}", n);
 
     let mut E_A: Vec<Vec<FieldElm>> = Vec::new();

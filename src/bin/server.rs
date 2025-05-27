@@ -108,6 +108,27 @@ impl Collector for CollectorServer {
         // Return a success string (here an empty string).
         future::ready("".to_string())
     }
+
+    fn add_polynomials_unknown(self, _: context::Context, poly_req: PolyRequestU2) -> Self::AddPolynomialsFut {
+        println!("Client: Received add_polynomials request with {} polynomials.", poly_req.poly.len());
+        // Try to lock the mutex.
+        let mut coll = match self.arc.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("Client: Mutex lock failed: {:?}", e);
+                // Instead of returning Err(...), return an error message as a String.
+                return future::ready("Mutex lock failed".to_string());
+            }
+        };
+    
+        for p in poly_req.poly {
+            coll.add_polynomial(p);
+        }
+        println!("Client: Updated collector; total polynomials now: {}", coll.poly.len());
+    
+        // Return a success string (here an empty string).
+        future::ready("".to_string())
+    }
     
     
     
@@ -183,11 +204,11 @@ impl Collector for CollectorServer {
             .collect();
 
         let results = coll.tree_crawl_last_known_poly(req.gc_sender, &mut channel_refs[..]);
-        let field_result = FieldElm::from_u64(results as u64);
+        //let field_result = FieldElm::from_u64(results as u64);
 
-        future::ready(vec![field_result])
+        //future::ready(vec![results])
 
-        //future::ready(results)  
+        future::ready(results)  
     }
 
     fn tree_prune(self, _: context::Context, req: TreePruneRequest) -> Self::TreePruneFut {

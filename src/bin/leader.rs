@@ -1,5 +1,5 @@
 use counttree::{add_bitstrings, collect, config, fastfield, rpc::{
-    AddKeysRequest, PolyRequest, FinalSharesRequest, ResetRequest,
+    AddKeysRequest, PolyRequest, PolyRequestU2, FinalSharesRequest, ResetRequest,
     TreeInitRequest,
     TreeCrawlRequest,
 }, string_to_bits, FieldElm, MSB_u32_to_bits};
@@ -24,8 +24,8 @@ use std::time::{Duration, SystemTime};
 use counttree::ibDCF::{eval_str, ibDCFKey};
 use counttree::rpc::{TreeCrawlLastRequest, TreePruneLastRequest, TreePruneRequest};
 use counttree::sample_covid_data::sample_covid_locations;
-use counttree::lagrange::{compute_polynomials};
-
+use counttree::lagrange::{compute_polynomials, compute_polynomials_prefix};
+use std::convert::TryInto;
 
 type IntervalKey = (ibDCFKey, ibDCFKey);
 fn long_context() -> context::Context {
@@ -331,6 +331,89 @@ async fn add_polynomials(
     }
 }
 
+async fn add_polynomials_unknown(
+    cfg: &config::Config,
+    client0: counttree::CollectorClient,
+    client1: counttree::CollectorClient,
+    strings: &Vec<Vec<Vec<bool>>>,
+    nreqs: usize,
+    aug_len: usize,
+) -> io::Result<()> {
+    println!("pub fn add_polynomials: starting to generate polynomials");
+    use rand::distributions::Distribution;
+    let mut rng = rand::thread_rng();
+    let zipf = zipf::ZipfDistribution::new(cfg.num_sites, cfg.zipf_exponent)
+        .unwrap(); // TODO: replace with real distribution
+
+    // Vectors to hold your batch of polynomial shares.
+    let mut addpoly0 = Vec::with_capacity(nreqs);
+    let mut addpoly1 = Vec::with_capacity(nreqs);
+
+    for i in 0..nreqs {
+        let mut client0_all = Vec::new();
+        let mut client1_all = Vec::new();
+
+
+        // Debug: report progress periodically.
+        if i % 1000 == 0 {
+            println!("Processing polynomial request {}/{}", i, nreqs);
+        }
+        let sample = zipf.sample(&mut rng) - 1;
+        let key_str = augment_string(strings[i].clone(), aug_len);
+
+        // Convert each Vec<bool> into a u64 inline.
+        let q: Vec<u64> = key_str
+            .iter()
+            .map(|bits| {
+                let mut value: u64 = 0;
+                for &b in bits {
+                    value = (value << 1) | if b { 1 } else { 0 };
+                }
+                value
+            })
+            .collect();
+
+        // Here we assume compute_polynomials returns a pair: (poly0, poly1)
+        let mut client0_all_dimension = Vec::new();
+        let mut client1_all_dimension = Vec::new();
+        for element in q{
+            let (poly0, poly1) = compute_polynomials_prefix(element, cfg.ball_size.try_into().unwrap(), cfg.data_len);
+            client0_all_dimension.push(poly0);
+            client1_all_dimension.push(poly1);
+
+        }
+        addpoly0.push(client0_all_dimension);
+        addpoly1.push(client1_all_dimension);
+    }
+
+    println!(
+        "Finished generating polynomials. Total requests: {}",
+        nreqs
+    );
+
+    let req0 = PolyRequestU2 { poly: addpoly0 };
+    let req1 = PolyRequestU2 { poly: addpoly1 };
+
+    println!("Sending polynomial requests to clients.");
+    let response0 = client0.add_polynomials_unknown(long_context(), req0.clone());
+    let response1 = client1.add_polynomials_unknown(long_context(), req1.clone());
+    println!("Requests sent. Awaiting responses...");
+
+    match try_join!(response0, response1) {
+        Ok(_) => {
+            println!("Received successful responses from both clients.");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error in try_join!: {:?}", e);
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Disconnected: {:?}", e),
+            ))
+        }
+    }
+}
+
 
 
 async fn add_keys(
@@ -486,12 +569,13 @@ async fn run_level_last_known_poly(
 
     println!("Keep: {:?}", keep);
 
-    let req = TreePruneLastRequest { keep };
-    let response0 = client0.tree_prune_last(long_context(), req.clone());
-    let response1 = client1.tree_prune_last(long_context(), req);
-    try_join!(response0, response1).unwrap();
-
-    Ok(vals0.len())
+    // let req = TreePruneLastRequest { keep };
+    // let response0 = client0.tree_prune_last(long_context(), req.clone());
+    // let response1 = client1.tree_prune_last(long_context(), req);
+    // try_join!(response0, response1).unwrap();
+    let num_trues = keep.iter().filter(|&&b| b).count();
+    println!("Number of trues: {}", num_trues);
+    Ok(num_trues)
 }
 
 async fn final_shares(
@@ -617,6 +701,66 @@ async fn main() -> io::Result<()> {
         Ok(())
     }
     else{
+        let aug_len = 2;
+        if cfg.distribution.as_str() == "zipf"{
+            println!("Zipf distribution sampling...");
+            let strings = generate_strings(&cfg, aug_len);
+            println!("Generated {:?} samples", strings.len());
+
+
+            reset_servers(&mut client0, &mut client1).await?;
+
+            let mut left_to_go = nreqs;
+            let reqs_in_flight = 1000;
+            while left_to_go > 0 {
+                let mut resps = vec![];
+
+                for _j in 0..reqs_in_flight {
+                    let this_batch = std::cmp::min(left_to_go, cfg.addkey_batch_size);
+                    left_to_go -= this_batch;
+
+                    if this_batch > 0 {
+                        resps.push(add_polynomials_unknown(
+                            &cfg,
+                            client0.clone(),
+                            client1.clone(),
+                            &strings,
+                            this_batch,
+                            aug_len
+                        ));
+                    }
+                }
+
+                for r in resps {
+                    r.await?;
+                }
+            }
+        }
+        tree_init(&mut client0, &mut client1).await?;
+
+
+        let start = Instant::now();
+        let mut active_paths = 0;
+        for level in 0..cfg.data_len-1 {
+            active_paths = run_level(&cfg, &mut client0, &mut client1, level, nreqs, start).await?;
+
+            println!(
+                "Level {:?} {:?}",
+                level,
+                start.elapsed().as_secs_f64()
+            );
+        }
+
+        let active_paths = run_level_last(&cfg, &mut client0, &mut client1, nreqs, start).await?;
+        println!(
+            "Level {:?} active_paths={:?} {:?}",
+            cfg.data_len,
+            active_paths,
+            start.elapsed().as_secs_f64()
+        );
+
+        final_shares(&mut client0, &mut client1).await?;
+
         Ok(())
     }
 }
